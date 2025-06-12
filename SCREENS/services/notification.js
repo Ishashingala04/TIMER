@@ -1,7 +1,7 @@
 import * as Notifications from "expo-notifications";
 
 export const handleNotification = (notification) => {
-    console.log("Notification received:", notification);
+    // console.log("Notification received:", notification);
 };
 
 // Handle notification response

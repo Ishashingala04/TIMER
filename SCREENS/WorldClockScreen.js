@@ -23,19 +23,12 @@ const WorldClockScreen = () => {
     const [searchType, setSearchType] = useState(null); // 'country' or 'city'
     
    
-   
-   
-   
-   
     const timeZoneData = moment.tz.names().map((timeZone) => {
         const country = timeZone.split('/').pop().replace('_', ' ');
         return { country, timeZone };
       });
    
-   
-   
-   
-   
+
    
     // Prepare timezone data efficiently
     const locationData = useMemo(() => {
