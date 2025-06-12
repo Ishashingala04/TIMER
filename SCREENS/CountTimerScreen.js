@@ -6,6 +6,7 @@ import {
     StyleSheet,
     Dimensions,
     ScrollView,
+    Platform,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Circle } from "react-native-svg";
@@ -15,41 +16,150 @@ import { AppState } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as BackgroundFetch from "expo-background-fetch";
 import * as TaskManager from "expo-task-manager";
-import {
-    cancelTimerNotification,
-    configureNotifications,
-    handleNotification,
-    handleNotificationResponse,
-} from "./services/notification";
-import { onTimerComplete, restoreTimers, startTimer } from "./services/timer";
 
 const BACKGROUND_FETCH_TASK = "background-fetch-task";
 const RECENT_TIMERS_STORAGE_KEY = "recent-timers";
 
+// Configure notifications to work properly when screen is locked
+Notifications.setNotificationHandler({
+    handleNotification: async () => ({
+        shouldShowAlert: true,
+        shouldPlaySound: true,
+        shouldSetBadge: true,
+        priority: Notifications.AndroidNotificationPriority.HIGH,
+    }),
+});
+
+// Create notification channel for Android
+const createNotificationChannel = async () => {
+    if (Platform.OS === 'android') {
+        await Notifications.setNotificationChannelAsync('timer-channel', {
+            name: 'Timer Notifications',
+            importance: Notifications.AndroidImportance.HIGH,
+            vibrationPattern: [0, 250, 250, 250],
+            lightColor: '#FF231F7C',
+            lockscreenVisibility: Notifications.AndroidNotificationVisibility.PUBLIC,
+            bypassDnd: true,
+            sound: true,
+        });
+    }
+};
+
+// Configure notifications for iOS to only show DISMISS action
+const configureIOSNotifications = async () => {
+    if (Platform.OS === 'ios') {
+        await Notifications.setNotificationCategoryAsync('timer', [
+            {
+                identifier: 'dismiss',
+                buttonTitle: 'Dismiss',
+                options: {
+                    isDestructive: false,
+                },
+            },
+        ]);
+    }
+};
+
+// Format timer display to avoid decimals
+const formatTimerDisplay = (secondsLeft) => {
+    // For hours display
+    if (secondsLeft >= 3600) {
+        return {
+            primaryDisplay: Math.floor(secondsLeft / 3600),
+            primaryUnit: 'hr',
+            secondaryDisplay: null
+        };
+    }
+    // For minutes display
+    else if (secondsLeft >= 60) {
+        return {
+            primaryDisplay: Math.floor(secondsLeft / 60),
+            primaryUnit: 'min',
+            secondaryDisplay: null
+        };
+    }
+    // For seconds display (no decimals)
+    else {
+        return {
+            primaryDisplay: Math.floor(secondsLeft),
+            primaryUnit: 'sec',
+            secondaryDisplay: null
+        };
+    }
+};
+
+// Schedule a notification with progress bar
+const scheduleTimerNotification = async (cardId, title, body, secondsLeft, originalSeconds) => {
+    // Calculate progress percentage for the notification
+    const progress = Math.min(100, Math.max(0, Math.round(secondsLeft / originalSeconds * 100)));
+    
+    // Create a notification that will be visible on lock screen
+    await Notifications.scheduleNotificationAsync({
+        content: {
+            title,
+            body,
+            data: { cardId, progress, originalSeconds },
+            sticky: true,
+            autoDismiss: false,
+            priority: 'high',
+            categoryIdentifier: 'timer',
+            ...(Platform.OS === 'android' && {
+                android: {
+                    channelId: 'timer-channel',
+                    actions: [{ title: 'Dismiss', identifier: 'dismiss' }],
+                    progress: { 
+                        max: 100, 
+                        current: progress,
+                        indeterminate: false
+                    },
+                },
+            }),
+        },
+        trigger: null, // Show immediately
+    });
+};
+
+// Cancel a timer notification
+const cancelTimerNotification = async (cardId) => {
+    const notifications = await Notifications.getAllScheduledNotificationsAsync();
+    for (const notification of notifications) {
+        if (notification.content.data?.cardId === cardId) {
+            await Notifications.cancelScheduledNotificationAsync(notification.identifier);
+        }
+    }
+};
+
+// Handle notification response (when user interacts with notification)
+const handleNotificationResponse = async (response) => {
+    const { notification } = response;
+    const data = notification.request.content.data;
+    
+    if (data?.isComplete) {
+        // User dismissed a completed timer notification
+        await cancelTimerNotification(data.cardId);
+    }
+};
+
+// Define background task for timer updates
 TaskManager.defineTask(BACKGROUND_FETCH_TASK, async () => {
     try {
         const now = Date.now();
-
-        // Get all active timers
         const keys = await AsyncStorage.getAllKeys();
         const timerKeys = keys.filter((key) => key.startsWith("timer-"));
         const timerData = await AsyncStorage.multiGet(timerKeys);
-
+        
         let updatedAny = false;
-
+        let completedTimers = [];
+        
         for (const [key, value] of timerData) {
             if (!value) continue;
-
+            
             const timer = JSON.parse(value);
             const cardId = parseInt(key.split("-")[1]);
-
-            // Only process non-paused timers
+            
             if (!timer.isPaused) {
-                const secondsLeft = Math.max(
-                    0,
-                    Math.floor((timer.endTime - now) / 1000)
-                );
-
+                const secondsLeft = Math.max(0, Math.floor((timer.endTime - now) / 1000));
+                
                 if (secondsLeft > 0) {
                     // Update timer state
                     await AsyncStorage.setItem(
@@ -61,45 +171,353 @@ TaskManager.defineTask(BACKGROUND_FETCH_TASK, async () => {
                         })
                     );
                     updatedAny = true;
-
-                    // Schedule next notification
-                    await Notifications.scheduleNotificationAsync({
-                        content: {
-                            title: "Timer Running",
-                            body: `${Math.ceil(
-                                secondsLeft / 60
-                            )} minutes remaining`,
-                            data: { cardId },
-                        },
-                        trigger: { seconds: 60 }, // Update notification every minute
-                    });
+                    
+                    // Update notification with progress
+                    const { primaryDisplay, primaryUnit } = formatTimerDisplay(secondsLeft);
+                    await scheduleTimerNotification(
+                        cardId,
+                        "Timer Running",
+                        `${primaryDisplay} ${primaryUnit} remaining`,
+                        secondsLeft,
+                        timer.originalSeconds
+                    );
                 } else {
                     // Timer completed
                     await AsyncStorage.removeItem(key);
+                    completedTimers.push(cardId);
                     updatedAny = true;
-
-                    // Show completion notification
+                    
+                    // Show completion notification that keeps ringing until dismissed
                     await Notifications.scheduleNotificationAsync({
                         content: {
                             title: "Timer Complete!",
-                            body: `Your timer is done`,
+                            body: "Your timer is done",
                             sound: true,
                             priority: "high",
+                            sticky: true,
+                            autoDismiss: false,
                             badge: 1,
+                            data: { cardId, isComplete: true },
+                            categoryIdentifier: 'timer',
                         },
                         trigger: null, // Show immediately
                     });
                 }
             }
         }
-
-        // Return success/failure without using BackgroundFetch.Result
-        return updatedAny ? 1 : 0; // 1 for success, 0 for no data
+        
+        // If any timer completed, check if there's a next timer to activate
+        if (completedTimers.length > 0) {
+            await activateNextTimer(completedTimers);
+        }
+        
+        return updatedAny ? 1 : 0;
     } catch (error) {
         console.error("[Background Fetch] Error:", error);
-        return -1; // -1 for failure
+        return -1;
     }
 });
+
+// Function to activate the next timer when one completes
+const activateNextTimer = async (completedTimerIds) => {
+    try {
+        const keys = await AsyncStorage.getAllKeys();
+        const timerKeys = keys.filter((key) => key.startsWith("timer-"));
+        
+        if (timerKeys.length === 0) return;
+        
+        // Sort timer keys by ID to find the next one
+        const sortedTimerKeys = timerKeys.sort((a, b) => {
+            const idA = parseInt(a.split("-")[1]);
+            const idB = parseInt(b.split("-")[1]);
+            return idA - idB;
+        });
+        
+        // Find the first timer after the completed ones
+        for (const completedId of completedTimerIds) {
+            const nextTimerKey = sortedTimerKeys.find(key => {
+                const id = parseInt(key.split("-")[1]);
+                return id > completedId;
+            });
+            
+            if (nextTimerKey) {
+                const timerData = await AsyncStorage.getItem(nextTimerKey);
+                if (timerData) {
+                    const timer = JSON.parse(timerData);
+                    // Activate this timer if it's paused
+                    if (timer.isPaused) {
+                        await AsyncStorage.setItem(
+                            nextTimerKey,
+                            JSON.stringify({
+                                ...timer,
+                                isPaused: false,
+                                startTime: Date.now(),
+                                endTime: Date.now() + timer.secondsLeft * 1000,
+                            })
+                        );
+                        
+                        // Notify about the next timer
+                        const cardId = parseInt(nextTimerKey.split("-")[1]);
+                        const { primaryDisplay, primaryUnit } = formatTimerDisplay(timer.secondsLeft);
+                        await scheduleTimerNotification(
+                            cardId,
+                            "Next Timer Started",
+                            `${primaryDisplay} ${primaryUnit} timer started`,
+                            timer.secondsLeft,
+                            timer.originalSeconds
+                        );
+                        
+                        break; // Only activate one next timer
+                    }
+                }
+            }
+        }
+    } catch (error) {
+        console.error("Error activating next timer:", error);
+    }
+};
+
+// Start a timer
+const startTimer = async (cardId, minutes, recentTimers, setRecentTimers, timerCards, setTimerCards) => {
+    try {
+        // Add to recent timers if not already there
+        if (!recentTimers.includes(minutes)) {
+            const newRecentTimers = [minutes, ...recentTimers.slice(0, 7)];
+            setRecentTimers(newRecentTimers);
+            await AsyncStorage.setItem(RECENT_TIMERS_STORAGE_KEY, JSON.stringify(newRecentTimers));
+        }
+        
+        const totalSeconds = minutes * 60;
+        const now = Date.now();
+        const endTime = now + totalSeconds * 1000;
+        
+        const timerData = {
+            minutes,
+            startTime: now,
+            endTime,
+            secondsLeft: totalSeconds,
+            isPaused: false,
+            lastUpdated: now,
+            originalSeconds: totalSeconds, // Store original seconds for progress calculation
+        };
+        
+        // Save timer to AsyncStorage
+        await AsyncStorage.setItem(`timer-${cardId}`, JSON.stringify(timerData));
+        
+        // Update UI
+        setTimerCards((prev) =>
+            prev.map((card) =>
+                card.id === cardId
+                    ? { ...card, activeTimer: timerData }
+                    : card
+            )
+        );
+        
+        // Schedule notification
+        const { primaryDisplay, primaryUnit } = formatTimerDisplay(totalSeconds);
+        await scheduleTimerNotification(
+            cardId,
+            "Timer Started",
+            `${primaryDisplay} ${primaryUnit} remaining`,
+            totalSeconds,
+            totalSeconds
+        );
+        
+        // Register background task if not already registered
+        const isRegistered = await TaskManager.isTaskRegisteredAsync(BACKGROUND_FETCH_TASK);
+        if (!isRegistered) {
+            await BackgroundFetch.registerTaskAsync(BACKGROUND_FETCH_TASK, {
+                minimumInterval: 60, // One minute minimum
+                stopOnTerminate: false,
+                startOnBoot: true,
+            });
+        }
+    } catch (error) {
+        console.error("Error starting timer:", error);
+    }
+};
+
+// Pause a timer
+const pauseTimer = async (cardId, setTimerCards) => {
+    try {
+        const timerKey = `timer-${cardId}`;
+        const timerData = await AsyncStorage.getItem(timerKey);
+        
+        if (timerData) {
+            const timer = JSON.parse(timerData);
+            const now = Date.now();
+            const secondsLeft = Math.max(0, Math.floor((timer.endTime - now) / 1000));
+            
+            const updatedTimer = {
+                ...timer,
+                isPaused: true,
+                secondsLeft,
+                lastUpdated: now,
+            };
+            
+            await AsyncStorage.setItem(timerKey, JSON.stringify(updatedTimer));
+            
+            setTimerCards((prev) =>
+                prev.map((card) =>
+                    card.id === cardId
+                        ? { ...card, activeTimer: updatedTimer }
+                        : card
+                )
+            );
+            
+            // Cancel notification
+            await cancelTimerNotification(cardId);
+        }
+    } catch (error) {
+        console.error("Error pausing timer:", error);
+    }
+};
+
+// Resume a timer
+const resumeTimer = async (cardId, setTimerCards) => {
+    try {
+        const timerKey = `timer-${cardId}`;
+        const timerData = await AsyncStorage.getItem(timerKey);
+        
+        if (timerData) {
+            const timer = JSON.parse(timerData);
+            const now = Date.now();
+            const endTime = now + timer.secondsLeft * 1000;
+            
+            const updatedTimer = {
+                ...timer,
+                isPaused: false,
+                startTime: now,
+                endTime,
+                lastUpdated: now,
+            };
+            
+            await AsyncStorage.setItem(timerKey, JSON.stringify(updatedTimer));
+            
+            setTimerCards((prev) =>
+                prev.map((card) =>
+                    card.id === cardId
+                        ? { ...card, activeTimer: updatedTimer }
+                        : card
+                )
+            );
+            
+            // Schedule notification
+            const { primaryDisplay, primaryUnit } = formatTimerDisplay(timer.secondsLeft);
+            await scheduleTimerNotification(
+                cardId,
+                "Timer Resumed",
+                `${primaryDisplay} ${primaryUnit} remaining`,
+                timer.secondsLeft,
+                timer.originalSeconds
+            );
+        }
+    } catch (error) {
+        console.error("Error resuming timer:", error);
+    }
+};
+
+// Handle timer completion
+const onTimerComplete = async (cardId, timerCards) => {
+    try {
+        // Remove timer from storage
+        await AsyncStorage.removeItem(`timer-${cardId}`);
+        
+        // Show completion notification
+        await Notifications.scheduleNotificationAsync({
+            content: {
+                title: "Timer Complete!",
+                body: "Your timer is done",
+                sound: true,
+                priority: "high",
+                sticky: true,
+                autoDismiss: false,
+                badge: 1,
+                data: { cardId, isComplete: true },
+                categoryIdentifier: 'timer',
+            },
+            trigger: null, // Show immediately
+        });
+        
+        // Find the next timer to activate
+        const nextCard = timerCards.find(card => 
+            card.id > cardId && card.activeTimer && card.activeTimer.isPaused
+        );
+        
+        if (nextCard) {
+            await resumeTimer(nextCard.id, () => {});
+        }
+    } catch (error) {
+        console.error("Error handling timer completion:", error);
+    }
+};
+
+// Restore timers from AsyncStorage
+const restoreTimers = async (setTimerCards) => {
+    try {
+        const keys = await AsyncStorage.getAllKeys();
+        const timerKeys = keys.filter((key) => key.startsWith("timer-"));
+        
+        if (timerKeys.length === 0) return;
+        
+        const timerData = await AsyncStorage.multiGet(timerKeys);
+        const now = Date.now();
+        
+        setTimerCards((prev) => {
+            const updatedCards = [...prev];
+            
+            for (const [key, value] of timerData) {
+                if (!value) continue;
+                
+                const timer = JSON.parse(value);
+                const cardId = parseInt(key.split("-")[1]);
+                
+                // Find or create card
+                let card = updatedCards.find((c) => c.id === cardId);
+                
+                if (!card) {
+                    card = {
+                        id: cardId,
+                        selectedHours: 0,
+                        selectedMinutes: 0,
+                        selectedSeconds: 0,
+                        activeTimer: null,
+                        incrementedValues: {
+                            1: 1,
+                            5: 5,
+                            10: 10,
+                            15: 15,
+                            30: 30,
+                        },
+                    };
+                    updatedCards.push(card);
+                }
+                
+                // Update timer state
+                if (!timer.isPaused) {
+                    const secondsLeft = Math.max(0, Math.floor((timer.endTime - now) / 1000));
+                    
+                    if (secondsLeft > 0) {
+                        card.activeTimer = {
+                            ...timer,
+                            secondsLeft,
+                        };
+                    } else {
+                        // Timer completed while app was closed
+                        AsyncStorage.removeItem(key);
+                        card.activeTimer = null;
+                    }
+                } else {
+                    card.activeTimer = timer;
+                }
+            }
+            
+            return updatedCards;
+        });
+    } catch (error) {
+        console.error("Error restoring timers:", error);
+    }
+};
 
 const SCREEN_WIDTH = Dimensions.get("window").width;
 const CIRCLE_SIZE = 34;
@@ -111,8 +529,6 @@ const COLORS = {
 };
 
 // TimeSelector Component with infinite scroll
-// TimeSelector Component with infinite scroll
-
 const TimeSelector = ({ type, max, value, setValue, cardId }) => {
     const handleIncrement = () => {
         const newValue = (value + 1) % max;
@@ -177,15 +593,17 @@ const CountTimerScreen = () => {
     ]);
 
     useEffect(() => {
-        configureNotifications();
+        // Initialize notifications
+        createNotificationChannel();
+        configureIOSNotifications();
 
         // Set up notification listeners
         const notificationListener =
-            Notifications.addNotificationReceivedListener(handleNotification);
+            Notifications.addNotificationReceivedListener((notification) => {
+                console.log("Notification received:", notification);
+            });
         const responseListener =
-            Notifications.addNotificationResponseReceivedListener(
-                handleNotificationResponse
-            );
+            Notifications.addNotificationResponseReceivedListener(handleNotificationResponse);
 
         return () => {
             Notifications.removeNotificationSubscription(notificationListener);
@@ -384,7 +802,6 @@ const CountTimerScreen = () => {
     };
 
     // Delete card
-    // Delete card
     const deleteCard = async (cardId) => {
         // First cancel any notifications
         await cancelTimerNotification(cardId);
@@ -420,11 +837,9 @@ const CountTimerScreen = () => {
                 return prev.filter((card) => card.id !== cardId);
             }
         });
-
-        // Clean up any running intervals or background tasks for this timer
     };
+
     // Timer countdown effect
-    // Modify timer countdown effect to handle completion
     useEffect(() => {
         const intervals = timerCards.map((card) => {
             if (
@@ -441,6 +856,10 @@ const CountTimerScreen = () => {
                                 if (newSecondsLeft <= 0) {
                                     // Timer completed, trigger notification
                                     onTimerComplete(card.id, timerCards);
+                                    return {
+                                        ...c,
+                                        activeTimer: null,
+                                    };
                                 }
                                 return {
                                     ...c,
@@ -474,7 +893,7 @@ const CountTimerScreen = () => {
                 circumference *
                 (1 -
                     card.activeTimer.secondsLeft /
-                        (card.activeTimer.minutes * 60));
+                        (card.activeTimer.originalSeconds || card.activeTimer.minutes * 60));
 
             return (
                 <View style={styles.countdownArc}>
@@ -557,8 +976,6 @@ const CountTimerScreen = () => {
                             }
                             style={styles.timerButton}
                         >
-
-                            
                             <Text style={styles.buttonText}>{time}</Text>
                         </TouchableOpacity>
                     ))}
@@ -571,8 +988,6 @@ const CountTimerScreen = () => {
                     {renderClockNumbers(card)}
 
                     {/* Center Display */}
-                    {/* Center Display */}
-
                     <View style={styles.centerDisplay}>
                         {card.activeTimer ? (
                             <>
@@ -602,10 +1017,10 @@ const CountTimerScreen = () => {
                                             )} min `}
                                         {card.activeTimer.secondsLeft % 60 >
                                             0 &&
-                                            `${
+                                            `${Math.floor(
                                                 card.activeTimer.secondsLeft %
                                                 60
-                                            } sec`}
+                                            )} sec`}
                                     </Text>
                                 </View>
 
@@ -618,6 +1033,8 @@ const CountTimerScreen = () => {
                                                     (card.activeTimer
                                                         .secondsLeft /
                                                         (card.activeTimer
+                                                            .originalSeconds || 
+                                                            card.activeTimer
                                                             .minutes *
                                                             60)) *
                                                     100
@@ -633,9 +1050,12 @@ const CountTimerScreen = () => {
                                         <Text
                                             style={styles.selectedDurationText}
                                         >
-                                            {Math.round(card.activeTimer.minutes)}
+                                            {formatTimerDisplay(card.activeTimer.secondsLeft).primaryDisplay}
                                         </Text>
                                     </View>
+                                    <Text style={styles.selectedDurationUnit}>
+                                        {formatTimerDisplay(card.activeTimer.secondsLeft).primaryUnit}
+                                    </Text>
                                 </View>
                             </>
                         ) : (
@@ -764,8 +1184,6 @@ const CountTimerScreen = () => {
                 </View>
 
                 {/* Player Controls */}
-
-                {/* Player Controls */}
                 <View style={styles.playerControls}>
                     {card.activeTimer ? (
                         card.activeTimer.isPaused ? (
@@ -804,7 +1222,23 @@ const CountTimerScreen = () => {
                         style={styles.stopButton}
                     />
 
-                    <TouchableOpacity style={styles.resetButton}>
+                    <TouchableOpacity 
+                        style={styles.resetButton}
+                        onPress={() => {
+                            deleteCard(card.id);
+                            setTimerCards(prev => 
+                                prev.map(c => 
+                                    c.id === card.id ? {
+                                        ...c,
+                                        selectedHours: 0,
+                                        selectedMinutes: 0,
+                                        selectedSeconds: 0,
+                                        activeTimer: null
+                                    } : c
+                                )
+                            );
+                        }}
+                    >
                         <Text style={styles.resetButtonText}>R</Text>
                     </TouchableOpacity>
                 </View>
@@ -822,7 +1256,7 @@ const CountTimerScreen = () => {
             </View>
         );
     };
-    console.log(globalRecentTimers.length, globalRecentTimers);
+
     return (
         <SafeAreaView style={styles.container}>
             <ScrollView contentContainerStyle={styles.scrollContent}>
@@ -857,19 +1291,11 @@ export const styles = StyleSheet.create({
         width: "100%",
         backgroundColor: COLORS.grey,
         flexDirection: "row",
-        justifyContent: "center",  // 👈 Prevent gaps
-        alignItems: "center",  // 👈 Ensure vertical alignment
+        justifyContent: "center",
+        alignItems: "center",
         padding: 10,
-      //  flexWrap: "wrap",  // 👈 Allows more circles if they exceed screen width
-    
-    overflow: "hidden",
+        overflow: "hidden",
     },
-    timerCircle: {
-        width: 300,
-        height: 300,
-        marginVertical: 20,
-    },
-
     timerCircle: {
         width: 300,
         height: 300,
@@ -884,26 +1310,23 @@ export const styles = StyleSheet.create({
     },
     countdownDisplay: {
         position: "absolute",
-        top: "25%", // Adjust this value to position the text block where you want it
+        top: "25%",
         alignItems: "center",
         gap: 5,
     },
-
     hoursText: {
         fontSize: 24,
         fontWeight: "bold",
         color: COLORS.blue,
         textAlign: "center",
     },
-
     minSecText: {
         fontSize: 20,
         fontWeight: "bold",
         color: COLORS.blue,
         textAlign: "center",
-        marginBottom: 15, // Space between text and progress bar
+        marginBottom: 15,
     },
-
     linearProgress: {
         width: 175,
         height: 10,
@@ -912,11 +1335,8 @@ export const styles = StyleSheet.create({
         overflow: "hidden",
         flexDirection: "row",
         position: "absolute",
-        top: "48%", // Adjust this to position the progress bar
+        top: "48%",
     },
-
-    // Update these styles in your StyleSheet
-
     centerDisplay: {
         position: "absolute",
         top: 0,
@@ -925,15 +1345,13 @@ export const styles = StyleSheet.create({
         bottom: 0,
         alignItems: "center",
         justifyContent: "center",
-        gap: 10, // Add spacing between elements
+        gap: 10,
     },
-
     countdownText: {
         fontSize: 24,
         fontWeight: "bold",
         color: COLORS.blue,
     },
-
     pauseButton: {
         width: 48,
         height: 48,
@@ -986,15 +1404,19 @@ export const styles = StyleSheet.create({
         backgroundColor: "#FFCC33",
         justifyContent: "center",
         alignItems: "center",
-        marginTop: 100, // Adjust the value as needed
+        marginTop: 100,
     },
-
     selectedDurationText: {
         fontSize: 45,
         fontWeight: "bold",
         color: "#0A612E",
     },
-
+    selectedDurationUnit: {
+        fontSize: 18,
+        fontWeight: "bold",
+        color: "#0A612E",
+        marginTop: 5,
+    },
     outerCircle: {
         position: "absolute",
         width: 300,
@@ -1055,27 +1477,42 @@ export const styles = StyleSheet.create({
     },
     selectorContainer: {
         width: CIRCLE_SIZE,
-        height: CIRCLE_SIZE,
+        height: CIRCLE_SIZE * 1.5,
         backgroundColor: "white",
         borderWidth: BORDER_WIDTH,
         borderColor: COLORS.blue,
         borderRadius: 4,
         overflow: "hidden",
+        flexDirection: "column",
+        justifyContent: "space-between",
     },
-    selectorItem: {
+    arrowButton: {
+        height: CIRCLE_SIZE * 0.5,
+        width: "100%",
         alignItems: "center",
         justifyContent: "center",
-    },
-    selectorText: {
-        fontSize: 16,
-        color: "#666",
-    },
-    selectedItem: {
         backgroundColor: "rgba(67, 136, 204, 0.1)",
+        padding: 0,
     },
-    selectedText: {
+    arrowText: {
+        color: COLORS.blue,
+        fontSize: 8,
+        lineHeight: 8,
+        height: 8,
+    },
+    numberDisplay: {
+        height: CIRCLE_SIZE * 0.5,
+        width: "100%",
+        alignItems: "center",
+        justifyContent: "center",
+        backgroundColor: "white",
+        padding: 0,
+    },
+    numberText: {
+        fontSize: 16,
         color: COLORS.blue,
         fontWeight: "bold",
+        lineHeight: 16,
     },
     bottomControls: {
         width: "100%",
@@ -1097,20 +1534,6 @@ export const styles = StyleSheet.create({
         color: COLORS.blue,
         fontWeight: "bold",
     },
-
-
-
-
-    circleContainer: {
-        flexDirection: "row",   // 👈 Make circles align in a row
-        justifyContent: "center",  // 👈 Prevent gaps
-        alignItems: "center",  // 👈 Ensure vertical alignment
-        gap: 0, // 👈 Ensure no gap (React Native 0.71+)
-    },
-
-
-
-
     timerButton: {
         width: CIRCLE_SIZE,
         height: CIRCLE_SIZE,
@@ -1120,8 +1543,8 @@ export const styles = StyleSheet.create({
         borderColor: COLORS.blue,
         alignItems: "center",
         justifyContent: "center",
-        flexShrink: 1,  // 👈 Prevents overlapping issues
-    marginHorizontal: 2, // 👈 Ensure small space for a clean layout
+        flexShrink: 1,
+        marginHorizontal: 2,
     },
     buttonText: {
         color: COLORS.blue,
@@ -1192,71 +1615,6 @@ export const styles = StyleSheet.create({
         fontSize: 32,
         color: COLORS.blue,
         fontWeight: "bold",
-    },
-
-    selectorContainer: {
-        width: CIRCLE_SIZE,
-        height: CIRCLE_SIZE,
-        backgroundColor: "white",
-        borderWidth: BORDER_WIDTH,
-        borderColor: COLORS.blue,
-        borderRadius: 4,
-        overflow: "hidden",
-    },
-    selectorItem: {
-        alignItems: "center",
-        justifyContent: "center",
-    },
-    selectorText: {
-        fontSize: 16,
-        color: "#666",
-    },
-    selectedItem: {
-        backgroundColor: "rgba(67, 136, 204, 0.1)",
-    },
-    selectedText: {
-        color: COLORS.blue,
-        fontWeight: "bold",
-    },
-
-    selectorContainer: {
-        width: CIRCLE_SIZE,
-        height: CIRCLE_SIZE * 1.5,
-        backgroundColor: "white",
-        borderWidth: BORDER_WIDTH,
-        borderColor: COLORS.blue,
-        borderRadius: 4,
-        overflow: "hidden",
-        flexDirection: "column",
-        justifyContent: "space-between",
-    },
-    arrowButton: {
-        height: CIRCLE_SIZE * 0.5,
-        width: "100%",
-        alignItems: "center",
-        justifyContent: "center",
-        backgroundColor: "rgba(67, 136, 204, 0.1)",
-        padding: 0,
-    },
-    arrowText: {
-        color: COLORS.blue,
-        fontSize: 8,
-        lineHeight: 8,
-        height: 8,
-    },
-    numberDisplay: {
-        height: CIRCLE_SIZE * 0.5,
-        width: "100%",
-        alignItems: "center",
-        justifyContent: "center",
-        backgroundColor: "white",
-        padding: 0,
-    },
-    numberText: {
-        fontSize: 16,
-        color: COLORS.blue,
-        fontWeight: "bold",
-        lineHeight: 16,
     },
 });
 
